@@ -345,13 +345,24 @@ fn normalize_voice(voice: Option<&str>, default: &str) -> String {
     }
 }
 
-const TTS_FORMATS: &[&str] = &["mp3", "wav", "flac", "pcm"];
+const TTS_FORMATS: &[&str] = &["mp3", "wav", "flac", "pcm", "opus"];
+
+/// MiniMax t2a_v2 cannot emit opus; opus requests are synthesized as mp3 upstream
+/// and transcoded to Ogg/Opus locally before being served.
+fn upstream_t2a_format(requested: &str) -> &str {
+    if requested == "opus" {
+        "mp3"
+    } else {
+        requested
+    }
+}
 
 fn content_type_for(format: &str) -> &'static str {
     match format {
         "wav" => "audio/wav",
         "flac" => "audio/flac",
         "pcm" => "audio/pcm",
+        "opus" => "audio/ogg",
         _ => "audio/mpeg",
     }
 }
@@ -402,7 +413,7 @@ async fn speech(
         Some(f) => {
             return openai_error(
                 StatusCode::BAD_REQUEST,
-                format!("unsupported response_format '{f}' (supported: mp3, wav, flac, pcm)"),
+                format!("unsupported response_format '{f}' (supported: mp3, wav, flac, pcm, opus)"),
             );
         }
     };
@@ -419,7 +430,7 @@ async fn speech(
         req.voice.as_deref(),
         req.speed,
         &state.default_voice,
-        &format,
+        upstream_t2a_format(&format),
     );
     let url = format!("{}/v1/t2a_v2", state.upstream_base);
     let resp = match state
@@ -507,6 +518,27 @@ async fn speech(
             return openai_error(StatusCode::BAD_GATEWAY, format!("audio read failed: {e}"));
         }
     };
+
+    if format == "opus" {
+        let (opus_bytes, ct) = match transcode_to_opus_ogg(&bytes).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!(error = %e, "opus transcode failed");
+                return openai_error(
+                    StatusCode::BAD_GATEWAY,
+                    format!("opus transcode failed: {e}"),
+                );
+            }
+        };
+        tracing::info!(bytes = opus_bytes.len(), "speech served (transcoded opus)");
+        return (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, ct)],
+            opus_bytes,
+        )
+            .into_response();
+    }
+
     tracing::info!(bytes = bytes.len(), "speech served");
     (
         StatusCode::OK,
@@ -514,6 +546,44 @@ async fn speech(
         bytes,
     )
         .into_response()
+}
+
+/// Transcode upstream audio (mp3) to Telegram-style Ogg/Opus (mono, 24 kHz, 64 kbps)
+/// via ffmpeg, matching the production Hermes wrapper's conversion settings.
+async fn transcode_to_opus_ogg(input: &[u8]) -> anyhow::Result<(Vec<u8>, &'static str)> {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let src = std::env::temp_dir().join(format!("vg-tts-{stamp}.mp3"));
+    let dst = std::env::temp_dir().join(format!("vg-tts-{stamp}.ogg"));
+    tokio::fs::write(&src, input).await?;
+    let out = tokio::process::Command::new("ffmpeg")
+        .args(["-y", "-loglevel", "error", "-i"])
+        .arg(&src)
+        .args([
+            "-ac", "1", "-ar", "24000", "-c:a", "libopus", "-b:a", "64k", "-f", "ogg",
+        ])
+        .arg(&dst)
+        .output()
+        .await;
+    // Remove temp files regardless of outcome.
+    let _ = tokio::fs::remove_file(&src).await;
+    let result = match out {
+        Ok(o) if o.status.success() => match tokio::fs::read(&dst).await {
+            Ok(data) if !data.is_empty() => Ok((data, "audio/ogg" as &'static str)),
+            Ok(_) => Err(anyhow::anyhow!("ffmpeg produced empty output")),
+            Err(e) => Err(anyhow::anyhow!("ffmpeg output unreadable: {e}")),
+        },
+        Ok(o) => Err(anyhow::anyhow!(
+            "ffmpeg exit {}: {}",
+            o.status,
+            String::from_utf8_lossy(&o.stderr).trim()
+        )),
+        Err(e) => Err(anyhow::anyhow!("ffmpeg spawn failed: {e}")),
+    };
+    let _ = tokio::fs::remove_file(&dst).await;
+    result
 }
 
 #[cfg(test)]
@@ -790,9 +860,16 @@ mod tests {
             .uri("/v1/audio/speech")
             .header("authorization", "Bearer bridge-key")
             .header("content-type", "application/json")
-            .body(Body::from(r#"{"input":"hi","response_format":"opus"}"#))
+            .body(Body::from(r#"{"input":"hi","response_format":"aiff"}"#))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn opus_requests_synthesize_as_mp3_upstream() {
+        assert_eq!(upstream_t2a_format("opus"), "mp3");
+        assert_eq!(upstream_t2a_format("wav"), "wav");
+        assert_eq!(upstream_t2a_format("mp3"), "mp3");
     }
 }
