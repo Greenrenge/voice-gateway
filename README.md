@@ -43,6 +43,10 @@ binary, ~15 MB Docker image.
 
 ## Endpoints
 
+- `GET /v1/models` — OpenAI-compatible model list returning configured
+  `MINIMAX_MODEL` (`task: "automatic-speech-recognition"`) and
+  `MINIMAX_TTS_MODEL` (`task: "text-to-speech"`), enforced with
+  `GATEWAY_API_KEY` when set.
 - `POST /v1/audio/transcriptions` — OpenAI multipart format (`file` required;
   `model`, `language`, `prompt`, `response_format` accepted and ignored — the
   upstream model is fixed by `MINIMAX_MODEL`). Returns `{"text": "..."}`;
