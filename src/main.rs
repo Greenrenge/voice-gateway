@@ -24,6 +24,9 @@ use serde_json::{json, Value};
 /// Max upload accepted from clients (OpenAI caps transcriptions at 25 MB).
 const MAX_BODY_BYTES: usize = 26 * 1024 * 1024;
 
+/// OpenBot caps discovered model and voice names at 256 bytes (`VOICE_SERVER_LIMITS.name`).
+const MAX_DISCOVERY_NAME_BYTES: usize = 256;
+
 #[derive(Clone)]
 struct AppState {
     http: reqwest::Client,
@@ -50,11 +53,9 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|_| "https://api.minimaxi.com".to_string())
         .trim_end_matches('/')
         .to_string();
-    let upstream_model = std::env::var("MINIMAX_MODEL").unwrap_or_else(|_| "asr-1.0".to_string());
-    let tts_model =
-        std::env::var("MINIMAX_TTS_MODEL").unwrap_or_else(|_| "speech-2.8-turbo".to_string());
-    let default_voice =
-        std::env::var("MINIMAX_VOICE").unwrap_or_else(|_| "female-shaonv".to_string());
+    let upstream_model = resolve_bounded_env("MINIMAX_MODEL", "asr-1.0")?;
+    let tts_model = resolve_bounded_env("MINIMAX_TTS_MODEL", "speech-2.8-turbo")?;
+    let default_voice = resolve_bounded_env("MINIMAX_VOICE", "female-shaonv")?;
     let bridge_key = std::env::var("GATEWAY_API_KEY")
         .ok()
         .filter(|k| !k.is_empty());
@@ -83,8 +84,32 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn normalize_env_model(raw: Option<&str>, default: &str) -> String {
+    raw.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| default.to_string())
+}
+
+fn validate_bounded_env(var: &str, raw: Option<&str>, default: &str) -> anyhow::Result<String> {
+    let val = normalize_env_model(raw, default);
+    anyhow::ensure!(
+        val.len() <= MAX_DISCOVERY_NAME_BYTES,
+        "{var} must be at most {MAX_DISCOVERY_NAME_BYTES} bytes (got {})",
+        val.len()
+    );
+    Ok(val)
+}
+
+fn resolve_bounded_env(var: &str, default: &str) -> anyhow::Result<String> {
+    validate_bounded_env(var, std::env::var(var).ok().as_deref(), default)
+}
+
 fn router(state: AppState) -> Router {
     Router::new()
+        .route("/v1/models", get(list_models))
+        .route("/v1/audio/voices", get(list_voices))
+        .route("/v1/audio/speech/voices", get(list_voices))
         .route("/v1/audio/transcriptions", post(transcribe))
         .route("/v1/audio/translations", post(transcribe))
         .route("/v1/audio/speech", post(speech))
@@ -106,9 +131,62 @@ async fn health() -> &'static str {
 async fn index() -> Json<Value> {
     Json(json!({
         "service": "voice-gateway",
-        "endpoints": ["/v1/audio/transcriptions", "/v1/audio/translations", "/v1/audio/speech"],
+        "endpoints": [
+            "/v1/audio/transcriptions",
+            "/v1/audio/translations",
+            "/v1/audio/speech",
+            "/v1/audio/voices",
+            "/v1/audio/speech/voices",
+            "/v1/models",
+        ],
         "upstream_model_env": "MINIMAX_MODEL (default asr-1.0), MINIMAX_TTS_MODEL (default speech-2.8-turbo)",
     }))
+}
+
+async fn list_models(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(resp) = check_inbound_auth(&state, &headers) {
+        return resp;
+    }
+    (
+        StatusCode::OK,
+        Json(json!({
+            "object": "list",
+            "data": [
+                {
+                    "id": state.upstream_model,
+                    "object": "model",
+                    "created": 0,
+                    "owned_by": "minimax",
+                    "task": "automatic-speech-recognition",
+                },
+                {
+                    "id": state.tts_model,
+                    "object": "model",
+                    "created": 0,
+                    "owned_by": "minimax",
+                    "task": "text-to-speech",
+                },
+            ],
+        })),
+    )
+        .into_response()
+}
+
+async fn list_voices(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(resp) = check_inbound_auth(&state, &headers) {
+        return resp;
+    }
+    let mut voices = Vec::with_capacity(DEFAULT_MINIMAX_VOICES.len() + 1);
+    let default = state.default_voice.trim();
+    if !default.is_empty() && default.len() <= MAX_DISCOVERY_NAME_BYTES {
+        voices.push(default.to_string());
+    }
+    for &voice in DEFAULT_MINIMAX_VOICES {
+        if !voices.iter().any(|existing| existing == voice) {
+            voices.push(voice.to_string());
+        }
+    }
+    (StatusCode::OK, Json(json!({ "voices": voices }))).into_response()
 }
 
 #[derive(Debug)]
@@ -326,23 +404,54 @@ struct TtsRequest {
     response_format: Option<String>,
 }
 
-/// Mirror the production Hermes wrapper's voice mapping: empty -> default,
-/// prefix `female-` unless already a known MiniMax voice id shape.
+const DEFAULT_MINIMAX_VOICES: &[&str] = &[
+    "female-shaonv",
+    "female-tianmei",
+    "female-yujie",
+    "male-qn-qingse",
+    "male-qn-jingying",
+    "male-qn-badao",
+    "presenter_female",
+    "audiobook_female_1",
+];
+
+const OPENAI_VOICE_ALIASES: &[(&str, &str)] = &[
+    ("alloy", "female-shaonv"),
+    ("ash", "male-qn-jingying"),
+    ("coral", "female-tianmei"),
+    ("echo", "male-qn-qingse"),
+    ("fable", "audiobook_female_1"),
+    ("nova", "female-yujie"),
+    ("onyx", "male-qn-badao"),
+    ("sage", "presenter_female"),
+    ("shimmer", "female-tianmei"),
+];
+
+/// Map empty -> default, standard OpenAI voices -> valid MiniMax voices,
+/// preserve MiniMax voice ID shapes (including mixed-case system/cloned IDs),
+/// and fall back to prefixing `female-` for bare shorthands like `shaonv`.
 fn normalize_voice(voice: Option<&str>, default: &str) -> String {
-    let v = voice
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_lowercase())
-        .unwrap_or_else(|| default.to_string());
-    if v.starts_with("female-")
-        || v.starts_with("male-")
-        || v == "presenter_female"
-        || v == "audiobook_female_1"
+    let Some(trimmed) = voice.map(str::trim).filter(|s| !s.is_empty()) else {
+        return default.trim().to_string();
+    };
+    let lower = trimmed.to_lowercase();
+    if let Some((_, mapped)) = OPENAI_VOICE_ALIASES
+        .iter()
+        .find(|(alias, _)| *alias == lower)
     {
-        v
-    } else {
-        format!("female-{}", v)
+        return (*mapped).to_string();
     }
+    if lower.starts_with("female-")
+        || lower.starts_with("male-")
+        || lower == "presenter_female"
+        || lower == "audiobook_female_1"
+    {
+        return lower;
+    }
+    if trimmed.contains('_') || trimmed.contains('-') {
+        return trimmed.to_string();
+    }
+    format!("female-{lower}")
 }
 
 const TTS_FORMATS: &[&str] = &["mp3", "wav", "flac", "pcm", "opus"];
@@ -510,6 +619,7 @@ async fn speech(
         .headers()
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
+        .filter(|ct| ct.starts_with("audio/"))
         .map(str::to_string)
         .unwrap_or_else(|| content_type_for(&format).to_string());
     let bytes = match audio.bytes().await {
@@ -871,5 +981,365 @@ mod tests {
         assert_eq!(upstream_t2a_format("opus"), "mp3");
         assert_eq!(upstream_t2a_format("wav"), "wav");
         assert_eq!(upstream_t2a_format("mp3"), "mp3");
+    }
+
+    #[tokio::test]
+    async fn models_returns_configured_asr_and_tts() {
+        let app = router(test_state());
+        let req = axum::http::Request::builder()
+            .method("GET")
+            .uri("/v1/models")
+            .header("authorization", "Bearer bridge-key")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(!resp.status().is_redirection());
+        assert_eq!(
+            resp.headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        assert!(bytes.len() < 1024, "payload too large: {}", bytes.len());
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["object"], "list");
+        let data = v["data"].as_array().unwrap();
+        assert_eq!(data.len(), 2);
+
+        assert_eq!(data[0]["id"], "asr-1.0");
+        assert_eq!(data[0]["object"], "model");
+        assert_eq!(data[0]["created"], 0);
+        assert_eq!(data[0]["owned_by"], "minimax");
+        assert_eq!(data[0]["task"], "automatic-speech-recognition");
+
+        assert_eq!(data[1]["id"], "speech-2.8-turbo");
+        assert_eq!(data[1]["object"], "model");
+        assert_eq!(data[1]["created"], 0);
+        assert_eq!(data[1]["owned_by"], "minimax");
+        assert_eq!(data[1]["task"], "text-to-speech");
+
+        for entry in data {
+            let id = entry["id"].as_str().unwrap();
+            assert!(!id.is_empty() && id.len() <= 256);
+        }
+    }
+
+    #[tokio::test]
+    async fn models_reflects_custom_env_models() {
+        let mut state = test_state();
+        state.upstream_model = "custom-asr-v2".into();
+        state.tts_model = "custom-tts-v3".into();
+        let app = router(state);
+        let req = axum::http::Request::builder()
+            .method("GET")
+            .uri("/v1/models")
+            .header("authorization", "Bearer bridge-key")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        let data = v["data"].as_array().unwrap();
+        assert_eq!(data.len(), 2);
+        assert_eq!(data[0]["id"], "custom-asr-v2");
+        assert_eq!(data[0]["task"], "automatic-speech-recognition");
+        assert_eq!(data[1]["id"], "custom-tts-v3");
+        assert_eq!(data[1]["task"], "text-to-speech");
+    }
+
+    #[tokio::test]
+    async fn models_rejects_missing_or_wrong_key() {
+        let req_missing = axum::http::Request::builder()
+            .method("GET")
+            .uri("/v1/models")
+            .body(Body::empty())
+            .unwrap();
+        let resp_missing = router(test_state()).oneshot(req_missing).await.unwrap();
+        assert_eq!(resp_missing.status(), StatusCode::UNAUTHORIZED);
+        let bytes_missing = resp_missing.into_body().collect().await.unwrap().to_bytes();
+        let err_missing: Value = serde_json::from_slice(&bytes_missing).unwrap();
+        assert!(err_missing["error"]["message"]
+            .as_str()
+            .map(|s| !s.is_empty())
+            .unwrap_or(false));
+
+        let req_wrong = axum::http::Request::builder()
+            .method("GET")
+            .uri("/v1/models")
+            .header("authorization", "Bearer wrong")
+            .body(Body::empty())
+            .unwrap();
+        let resp_wrong = router(test_state()).oneshot(req_wrong).await.unwrap();
+        assert_eq!(resp_wrong.status(), StatusCode::UNAUTHORIZED);
+        let bytes_wrong = resp_wrong.into_body().collect().await.unwrap().to_bytes();
+        let err_wrong: Value = serde_json::from_slice(&bytes_wrong).unwrap();
+        assert!(err_wrong["error"]["message"]
+            .as_str()
+            .map(|s| !s.is_empty())
+            .unwrap_or(false));
+    }
+
+    #[tokio::test]
+    async fn models_allows_open_mode() {
+        let mut state = test_state();
+        state.bridge_key = None;
+        let app = router(state);
+        let req = axum::http::Request::builder()
+            .method("GET")
+            .uri("/v1/models")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["object"], "list");
+        assert_eq!(v["data"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn index_includes_models_endpoint() {
+        let app = router(test_state());
+        let req = axum::http::Request::builder()
+            .method("GET")
+            .uri("/")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        let endpoints = v["endpoints"].as_array().unwrap();
+        assert!(endpoints.iter().any(|e| e == "/v1/models"));
+    }
+
+    #[test]
+    fn model_env_normalization_trims_and_falls_back() {
+        assert_eq!(normalize_env_model(None, "asr-1.0"), "asr-1.0");
+        assert_eq!(normalize_env_model(Some(""), "asr-1.0"), "asr-1.0");
+        assert_eq!(
+            normalize_env_model(Some("  \t\n "), "speech-2.8-turbo"),
+            "speech-2.8-turbo"
+        );
+        assert_eq!(
+            normalize_env_model(Some("  custom-asr  "), "asr-1.0"),
+            "custom-asr"
+        );
+    }
+
+    #[tokio::test]
+    async fn models_allows_identical_asr_and_tts_ids() {
+        let mut state = test_state();
+        state.upstream_model = "shared-voice-model".into();
+        state.tts_model = "shared-voice-model".into();
+        let app = router(state);
+        let req = axum::http::Request::builder()
+            .method("GET")
+            .uri("/v1/models")
+            .header("authorization", "Bearer bridge-key")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        let data = v["data"].as_array().unwrap();
+        assert_eq!(data.len(), 2);
+        assert_eq!(data[0]["id"], "shared-voice-model");
+        assert_eq!(data[0]["task"], "automatic-speech-recognition");
+        assert_eq!(data[1]["id"], "shared-voice-model");
+        assert_eq!(data[1]["task"], "text-to-speech");
+    }
+
+    #[tokio::test]
+    async fn voices_returns_default_first_and_deduplicated() {
+        let mut state = test_state();
+        state.default_voice = "English_Graceful_Lady".into();
+        for path in ["/v1/audio/voices", "/v1/audio/speech/voices"] {
+            let req = axum::http::Request::builder()
+                .method("GET")
+                .uri(path)
+                .header("authorization", "Bearer bridge-key")
+                .body(Body::empty())
+                .unwrap();
+            let resp = router(state.clone()).oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert!(!resp.status().is_redirection());
+            let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+            let v: Value = serde_json::from_slice(&bytes).unwrap();
+            let voices: Vec<&str> = v["voices"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_str().unwrap())
+                .collect();
+            assert_eq!(voices.first().copied(), Some("English_Graceful_Lady"));
+            assert!(voices.contains(&"female-shaonv"));
+            assert!(voices
+                .iter()
+                .all(|voice| !voice.is_empty() && voice.len() <= 256));
+        }
+    }
+
+    #[tokio::test]
+    async fn voices_deduplicates_default_when_already_listed() {
+        let app = router(test_state());
+        let req = axum::http::Request::builder()
+            .method("GET")
+            .uri("/v1/audio/voices")
+            .header("authorization", "Bearer bridge-key")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        let voices: Vec<&str> = v["voices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_str().unwrap())
+            .collect();
+        let count = voices.iter().filter(|&&x| x == "female-shaonv").count();
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn voices_rejects_missing_or_wrong_key() {
+        for path in ["/v1/audio/voices", "/v1/audio/speech/voices"] {
+            let req = axum::http::Request::builder()
+                .method("GET")
+                .uri(path)
+                .header("authorization", "Bearer wrong")
+                .body(Body::empty())
+                .unwrap();
+            let resp = router(test_state()).oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        }
+    }
+
+    #[tokio::test]
+    async fn index_includes_voice_endpoints() {
+        let app = router(test_state());
+        let req = axum::http::Request::builder()
+            .method("GET")
+            .uri("/")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        let endpoints = v["endpoints"].as_array().unwrap();
+        assert!(endpoints.iter().any(|e| e == "/v1/audio/voices"));
+        assert!(endpoints.iter().any(|e| e == "/v1/audio/speech/voices"));
+    }
+
+    #[test]
+    fn voice_normalization_maps_openai_and_preserves_minimax_ids() {
+        assert_eq!(normalize_voice(Some("alloy"), "female-shaonv"), "female-shaonv");
+        assert_eq!(normalize_voice(Some("ALLOY"), "female-shaonv"), "female-shaonv");
+        assert_eq!(normalize_voice(Some("echo"), "female-shaonv"), "male-qn-qingse");
+        assert_eq!(normalize_voice(Some("onyx"), "female-shaonv"), "male-qn-badao");
+        assert_eq!(normalize_voice(Some("nova"), "female-shaonv"), "female-yujie");
+        assert_eq!(normalize_voice(Some("shimmer"), "female-shaonv"), "female-tianmei");
+        assert_eq!(normalize_voice(Some("ash"), "female-shaonv"), "male-qn-jingying");
+        assert_eq!(normalize_voice(Some("coral"), "female-shaonv"), "female-tianmei");
+        assert_eq!(normalize_voice(Some("fable"), "female-shaonv"), "audiobook_female_1");
+        assert_eq!(normalize_voice(Some("sage"), "female-shaonv"), "presenter_female");
+        assert_eq!(
+            normalize_voice(Some("English_Graceful_Lady"), "female-shaonv"),
+            "English_Graceful_Lady"
+        );
+        assert_eq!(
+            normalize_voice(Some("moss_audio_1234"), "female-shaonv"),
+            "moss_audio_1234"
+        );
+        assert_eq!(
+            normalize_voice(None, "English_Graceful_Lady"),
+            "English_Graceful_Lady"
+        );
+    }
+
+    #[test]
+    fn validate_bounded_env_rejects_overlong_values() {
+        assert_eq!(
+            validate_bounded_env("MINIMAX_MODEL", Some("  "), "asr-1.0").unwrap(),
+            "asr-1.0"
+        );
+        let exact = "a".repeat(256);
+        assert_eq!(
+            validate_bounded_env("MINIMAX_MODEL", Some(&exact), "asr-1.0").unwrap(),
+            exact
+        );
+        let too_long = "a".repeat(257);
+        assert!(validate_bounded_env("MINIMAX_MODEL", Some(&too_long), "asr-1.0").is_err());
+    }
+
+    #[tokio::test]
+    async fn speech_wav_falls_back_from_octet_stream_content_type() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let audio_url = format!("http://{addr}/audio/out.wav");
+        let upstream = Router::new()
+            .route(
+                "/v1/t2a_v2",
+                post(move |Json(body): Json<Value>| {
+                    let audio_url = audio_url.clone();
+                    async move {
+                        assert_eq!(body["voice_setting"]["voice_id"], "female-shaonv");
+                        assert_eq!(body["audio_setting"]["format"], "wav");
+                        Json(json!({"data": {"audio": audio_url}, "base_resp": {"status_code": 0}}))
+                    }
+                }),
+            )
+            .route(
+                "/audio/out.wav",
+                get(|| async {
+                    (
+                        [(header::CONTENT_TYPE, "application/octet-stream")],
+                        Bytes::from_static(b"RIFF\x24\x00\x00\x00WAVEfmt "),
+                    )
+                }),
+            );
+        tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+
+        let state = AppState {
+            http: reqwest::Client::new(),
+            upstream_base: format!("http://{addr}"),
+            upstream_model: "asr-1.0".into(),
+            tts_model: "speech-2.8-turbo".into(),
+            default_voice: "female-shaonv".into(),
+            minimax_key: "minimax-secret".into(),
+            bridge_key: None,
+        };
+        let app = router(state);
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/audio/speech")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "model": "speech-2.8-turbo",
+                    "voice": "alloy",
+                    "input": "Hello OpenBot",
+                    "response_format": "wav"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("audio/wav")
+        );
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        assert!(bytes.starts_with(b"RIFF"));
     }
 }

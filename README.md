@@ -43,16 +43,24 @@ binary, ~15 MB Docker image.
 
 ## Endpoints
 
+- `GET /v1/models` — OpenAI-compatible model list returning configured
+  `MINIMAX_MODEL` (`task: "automatic-speech-recognition"`) and
+  `MINIMAX_TTS_MODEL` (`task: "text-to-speech"`), enforced with
+  `GATEWAY_API_KEY` when set.
 - `POST /v1/audio/transcriptions` — OpenAI multipart format (`file` required;
   `model`, `language`, `prompt`, `response_format` accepted and ignored — the
   upstream model is fixed by `MINIMAX_MODEL`). Returns `{"text": "..."}`;
   `response_format`/`x-response-format: verbose_json` returns
   `{"task", "language", "duration", "text", "segments"}`.
 - `POST /v1/audio/translations` — same handler, for SDKs that POST there.
+- `GET /v1/audio/voices` (and `GET /v1/audio/speech/voices`) — returns
+  `{"voices": [...]}` starting with `MINIMAX_VOICE` followed by built-in
+  MiniMax voices, enforced with `GATEWAY_API_KEY` when set.
 - `POST /v1/audio/speech` — OpenAI TTS JSON format (`input` required;
-  `voice` is normalized the same way as MiniMax's own clients, `speed`
-  clamped to 0.5–2.0, `response_format` ∈ `mp3|wav|flac|pcm`). Returns raw
-  audio bytes.
+  standard OpenAI voices like `alloy`/`echo`/`nova` map to valid MiniMax
+  voices, MiniMax voice IDs are preserved, bare shorthands get `female-`,
+  `speed` clamped to 0.5–2.0, `response_format` ∈ `mp3|wav|flac|pcm|opus`).
+  Returns raw audio bytes.
 - `GET /healthz` — liveness.
 
 Upstream MiniMax errors (`base_resp.status_code != 0`) are surfaced as
